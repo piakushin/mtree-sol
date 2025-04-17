@@ -1,5 +1,7 @@
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcTransactionConfig};
 use solana_program::instruction::{AccountMeta, Instruction};
@@ -18,13 +20,15 @@ pub enum MTreeInstruction {
 }
 
 fn main() -> Result<()> {
+    dotenv::dotenv()?;
+
     // Setup
-    let program_id = get_program_id();
-    let payer = get_payer();
+    let program_id = get_program_id()?;
+    let payer = get_payer()?;
 
     let client = get_client();
 
-    let mtree_account = create_mtree_account(program_id, &payer, &client);
+    let mtree_account = create_mtree_account(program_id, &payer, &client)?;
 
     // Build transaction
     let leaf_data = get_leaf_data()?;
@@ -41,25 +45,35 @@ fn main() -> Result<()> {
     );
 
     let mut transaction = Transaction::new_with_payer(&[insert_leaf_ix], Some(&payer.pubkey()));
-    transaction.sign(&[&payer], client.get_latest_blockhash().unwrap());
+    let recent_blockhash = client
+        .get_latest_blockhash()
+        .with_context(|| "Failed to get latest blockhash")?;
+    transaction.sign(&[&payer], recent_blockhash);
 
     // Send and confirm the transaction
     let signature = client.send_and_confirm_transaction(&transaction)?;
     println!("Transaction confirmed: {signature}");
 
     // Extract hash from logs
-    let tx = client
-        .get_transaction_with_config(
-            &signature,
-            RpcTransactionConfig {
-                encoding: None,
-                commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: None,
-            },
-        )
-        .unwrap();
-    let logs = tx.transaction.meta.unwrap().log_messages.unwrap();
-    let msg_with_root = logs.get(3).unwrap();
+    let tx = client.get_transaction_with_config(
+        &signature,
+        RpcTransactionConfig {
+            encoding: None,
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: None,
+        },
+    )?;
+    let logs = tx
+        .transaction
+        .meta
+        .ok_or(anyhow!("Meta is not set"))?
+        .log_messages
+        .ok_or(anyhow!("Log messages are no set"))?;
+
+    let msg_with_root = logs
+        .get(3)
+        .ok_or(anyhow!("Log messages are shorter than expected"))?;
+
     let root = &msg_with_root[(msg_with_root.len() - 62)..];
     println!("===================================================");
     println!("New root hash: {root}");
@@ -70,16 +84,21 @@ fn main() -> Result<()> {
 fn get_leaf_data() -> Result<Vec<u8>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        Err(anyhow!(
-            "Expected one argument: the data to insert into the Merkle tree"
-        ))
+        bail!("Expected one argument: the data to insert into the Merkle tree")
     } else {
         Ok(args[1].as_bytes().to_vec())
     }
 }
 
-fn create_mtree_account(program_id: Pubkey, payer: &Keypair, client: &RpcClient) -> Keypair {
-    let mtree_account = Keypair::read_from_file("mtree.json").unwrap();
+fn create_mtree_account(
+    program_id: Pubkey,
+    payer: &Keypair,
+    client: &RpcClient,
+) -> Result<Keypair> {
+    let mtree_account = Keypair::read_from_file(
+        dotenv::var("MTREE_ACCOUNT_KEYPAIR_JSON").expect("Missing keypair for mtree account"),
+    )
+    .expect("Generate json with keypair for storing MTree and set MTREE_ACCOUNT_KEYPAIR_JSON var");
 
     if client
         .get_account_with_commitment(&mtree_account.pubkey(), CommitmentConfig::confirmed())
@@ -88,9 +107,7 @@ fn create_mtree_account(program_id: Pubkey, payer: &Keypair, client: &RpcClient)
         .is_none()
     {
         // Create account for storing the merkle tree
-        let rent = client
-            .get_minimum_balance_for_rent_exemption(10000)
-            .unwrap(); // Estimate space needed
+        let rent = client.get_minimum_balance_for_rent_exemption(10000)?; // Estimate space needed
         let create_account_ix = system_instruction::create_account(
             &payer.pubkey(),
             &mtree_account.pubkey(),
@@ -101,35 +118,35 @@ fn create_mtree_account(program_id: Pubkey, payer: &Keypair, client: &RpcClient)
         // Add the instruction to new transaction
         let mut transaction =
             Transaction::new_with_payer(&[create_account_ix], Some(&payer.pubkey()));
-        transaction.sign(
-            &[payer, &mtree_account],
-            client.get_latest_blockhash().unwrap(),
-        );
+        transaction.sign(&[payer, &mtree_account], client.get_latest_blockhash()?);
 
         // Send and confirm the transaction
         println!("Sending transaction");
-        let signature = client.send_and_confirm_transaction(&transaction).unwrap();
+        let signature = client.send_and_confirm_transaction(&transaction)?;
         println!("Transaction confirmed: {signature}");
     }
-    mtree_account
+    Ok(mtree_account)
 }
 
-fn get_program_id() -> Pubkey {
-    let program_id = Keypair::read_from_file("target/deploy/mtree_program-keypair.json")
-        .map_err(|e| anyhow!("Failed to read keypair: {e}"))
-        .unwrap()
-        .pubkey();
+fn get_program_id() -> Result<Pubkey> {
+    let program_id = Keypair::read_from_file(
+        dotenv::var("PROGRAM_KEYPAIR_JSON").expect("Missing program keypair file"),
+    )
+    .map_err(|e| anyhow!("Failed to read keypair: {e}"))?
+    .pubkey();
     dbg!(&program_id);
-    program_id
+    Ok(program_id)
 }
 
 fn get_client() -> RpcClient {
-    let rpc_url = String::from("http://127.0.0.1:8899");
+    let rpc_url = dotenv::var("RPC_URL").expect("Missing solana rpc url");
     RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed())
 }
 
-fn get_payer() -> Keypair {
-    Keypair::read_from_file("QNdq2shSxGJcQU2dJdmR8vUwQD9hFtGVa7jBHJrxPUr.json")
-        .map_err(|e| anyhow!("Failed to read keypair: {e}"))
-        .unwrap()
+fn get_payer() -> Result<Keypair> {
+    let payer = Keypair::read_from_file(
+        dotenv::var("PAYER_KEYPAIR_JSON").expect("Missing payer keypair file"),
+    )
+    .map_err(|e| anyhow!("Failed to read keypair: {e}"))?;
+    Ok(payer)
 }

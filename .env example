@@ -1,0 +1,11 @@
+# solana-keygen new -o payer.json
+PAYER_KEYPAIR_JSON="payer.json"
+
+# local-test-validator
+RPC_URL="http://127.0.0.1:8899"
+
+# cargo build-sbf
+PROGRAM_KEYPAIR_JSON="target/deploy/mtree_program-keypair.json"
+
+# solana-keygen new -o mtree.json
+MTREE_ACCOUNT_KEYPAIR_JSON="mtree.json"
